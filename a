@@ -1,0 +1,52 @@
+def scdType2 (rawDf: DataFrame,baseDf: DataFrame,primaryKeys:List[String],scdType2Key:List[String],scdType2ColDropList:List[String]): DataFrame = {
+    val currentTime: String = time.LocalDateTime.now().toString
+    val expirationTime: String = "2500-01-01 00:00:00.000"
+
+    // Identify the keys affected by the delta dataframe
+
+    val affectedKeys = {
+      rawDf.select(primaryKeys.map(m => col(m)): _*).distinct()
+    }
+    //Define the partition of the destination dataframe not affected by the delta dataframe
+    val nonAffectedPartation = baseDf.join(broadcast(affectedKeys),primaryKeys,"left_anti").select(baseDf("*"))
+    // Identify the affected partition in the destination dataframe
+    val affectedPartation = baseDf.join(nonAffectedPartation, primaryKeys, "left_anti").filter("current_ind=1").select(baseDf("*"))
+
+    //val excludeColumns = List("pk", "effective_ts", "expiration_ts", "current_ind", "geo_region_cd", "tz_cd", "create_user", "create_ts", "upd_user", "upd_ts")
+    val excludeColumns = scd_columns ++ primaryKeys
+    val busColList = rawDf.columns.toList.filterNot(excludeColumns.contains)
+
+    // Identify the new records to be inserted from the delta dataframe
+    val deltaDfInsert = rawDf.join(baseDf, primaryKeys, "left_anti").select(rawDf("*"))
+
+    // Identify the records to be updated in the destination dataframe from the delta dataframe
+    val deltaDfUpsJoin = rawDf.join(deltaDfInsert, primaryKeys, "left_anti").select(rawDf("*"))
+    val deltaDfUps = addColumns(deltaDfUpsJoin)
+
+    // Combine the updated delta dataframe with the affected partition of the destination dataframe after dropping SCD type2 audit columns
+    val unionAllDf = affectedPartation.union(deltaDfUps)
+    // Create a new dataframe by de-duplicating unionUpdatedDf
+    // Use a checksum to compare current and previous rows (lag function)
+    // If the checksums for current and previous rows are different or if the previous row is null, mark it as 'Y' (indicating a unique record)
+    // Filter out the rows marked as 'N' (indicating duplicate records)
+    val dedupDf = unionAllDf.withColumn("colChkSum", concat_ws(",", busColList.map(k => col(k)): _*)).withColumn("colLagChkSum", lag(col("colChkSum"), 1, null).over(Window.partitionBy(primaryKeys.map(k => col(k)): _*).orderBy(col("effective_ts").cast("timestamp")))).withColumn("colDedupFlag", when(col("colChkSum") =!= col("colLagChkSum") || col("colLagChkSum").isNull, lit("Y")).otherwise(lit("N"))).filter(col("colDedupFlag") === lit("Y")).drop(col("colChkSum")).drop(col("colLagChkSum")).drop(col("colDedupFlag"))
+    val expDf = dedupDf.withColumn("effective_ts", col("effective_ts")).withColumn("expiration_ts", lead((col("effective_ts").cast("timestamp") - expr("INTERVAL 1 DAY")).cast("string"), 1, "2500-01-01 00:00:00.000").over(Window.partitionBy(primaryKeys.map(k => col(k)): _*).orderBy(col("effective_ts").cast("timestamp")))).withColumn("current_ind", when(col("expiration_ts") === "2500-01-01 00:00:00.000", lit("1")).otherwise(lit("0"))).withColumn("upd_ts", when(col("current_ind") === "0", lit(currentTime)).otherwise(col("upd_ts")))
+    expDf.union(nonAffectedPartation)
+  }
+  
+  
+  def addColumns (df: DataFrame): DataFrame=
+  {
+    val currentTime: String = LocalDateTime.now().toString
+    val expirationTime: String = "2500-01-01 00:00:00.000"
+
+    df.withColumn("effective_ts", lit(currentTime))
+      .withColumn("expiration_ts", lit(expirationTime))
+      .withColumn("current_ind", lit(1))
+      .withColumn("geo_region_cd", lit(geo_region_cd))
+      .withColumn("tz_cd", lit(tz_cd))
+      .withColumn("create_user", lit(create_user))
+      .withColumn("create_ts", lit(currentTime))
+      .withColumn("upd_user", lit(create_user))
+      .withColumn("upd_ts", lit(currentTime))
+  }
