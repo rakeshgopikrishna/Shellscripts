@@ -1,0 +1,32 @@
+Sure, here is a User Defined Function (UDF) in Spark Scala that you can use to perform the coalesce or repartition on a DataFrame based on the data and partitions present in it. The function `repartitionOrCoalesce` will decide to repartition or coalesce on a DataFrame based on the number of records and the number of partitions.
+
+```scala
+import org.apache.spark.sql.DataFrame
+
+def repartitionOrCoalesce(df: DataFrame, numRecords: Long, numPartitions: Int): DataFrame = {
+  val recordsPerPartition = 50000 // this is a threshold, you can adjust it according to your case
+  val newPartitions = (numRecords / recordsPerPartition).toInt
+
+  if (newPartitions == 0) {
+    df // if the number of records is less than the threshold, return the original DataFrame
+  }
+  else if (newPartitions < numPartitions) {
+    df.coalesce(newPartitions) // if the new number of partitions is less than the original number, coalesce the DataFrame
+  }
+  else {
+    df.repartition(newPartitions) // if the new number of partitions is more than the original number, repartition the DataFrame
+  }
+}
+
+// usage
+val df = spark.read.format("csv").option("header", "true").load("path_to_your_file.csv")
+val numRecords = df.count()
+val numPartitions = df.rdd.getNumPartitions
+val newDF = repartitionOrCoalesce(df, numRecords, numPartitions)
+```
+
+Please note: 
+- The `recordsPerPartition` variable is a threshold you can adjust according to your case.
+- The `numRecords` is the total number of records in the DataFrame.
+- The `numPartitions` is the original number of partitions of the DataFrame.
+- You may want to modify this function based on your specific case.
