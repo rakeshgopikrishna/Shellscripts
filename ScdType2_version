@@ -1,0 +1,74 @@
+  def addColumns (rawDf: DataFrame,dataDate:String,auditTimeStamps:List[String]): DataFrame=
+  {
+    val currentTime: String = LocalDateTime.now().toString
+    val updateTime:String = auditTimeStamps.last
+    val rawProcessDf=rawDf.withColumn("effective_ts", col(updateTime))
+      .withColumn("expiration_ts", lit(SC.expirationTime))
+      .withColumn("current_ind", lit(1))
+      .withColumn("geo_region_cd", lit(SC.geo_region_cd))
+      .withColumn("tz_cd", lit(SC.tz_cd))
+      .withColumn("create_user", lit(SC.create_user))
+      .withColumn("create_ts", lit(currentTime))
+      .withColumn("upd_user", lit(SC.create_user))
+      .withColumn("upd_ts", lit(currentTime))
+      .withColumn("data_date", lit(dataDate))
+    rawProcessDf
+  }
+
+
+  def scdType2 (rawDf: DataFrame,baseDf: DataFrame,primaryKeys:List[String],scdType2Key:List[String],dataDate:String,auditTimeStamps:List[String],baseEmptyDf: DataFrame): DataFrame = {
+    val currentTime: String = time.LocalDateTime.now().toString
+    val expirationTime: String = SC.expirationTime
+    import com.walmart.reusable.sparkaid.DataFrameUtil._
+    // Identify the keys affected by the delta dataframe
+    val affectedKeys = {
+      rawDf.select(primaryKeys.map(m => col(m)): _*).distinct()
+    }
+    //Define the partition of the destination dataframe not affected by the delta dataframe
+    val nonAffectedPartation = baseDf.join(broadcast(affectedKeys),primaryKeys,"left_anti").select(baseDf("*"))
+    // Identify the affected partition in the destination dataframe
+    val affectedPartation = baseDf.join(nonAffectedPartation, primaryKeys, "left_anti").filter("current_ind=1").select(baseDf("*"))
+    //val excludeColumns = List("pk", "effective_ts", "expiration_ts", "current_ind", "geo_region_cd", "tz_cd", "create_user", "create_ts", "upd_user", "upd_ts")
+    val baseExcludeColumns = SC.scd_audit_columns ++ primaryKeys ++ auditTimeStamps
+    val rawExcludeColumns = primaryKeys ++ auditTimeStamps
+    val baseScdType2Columns = if (scdType2Key.head == SC.notFound) rawDf.columns.toList.filterNot(baseExcludeColumns.contains)  else scdType2Key.toString.split(",").toList
+    val rawScdType2Columns = if (scdType2Key.head == SC.notFound) rawDf.columns.toList.filterNot(rawExcludeColumns.contains)  else scdType2Key.toString.split(",").toList
+    val scdType2Columns = baseScdType2Columns ++ rawScdType2Columns
+    //val scdType2Columns = raw_df.columns.toList.filter(_ != "pk").filter(_ != "effective_ts").filter(_ != "expiration_ts").filter(_ != "current_ind").filter(_ != "geo_region_cd").filter(_ != "tz_cd").filter(_ != "create_user").filter(_ != "create_ts").filter(_ != "upd_user").filter(_ != "upd_ts")
+    // Identify the new records to be inserted from the delta dataframe
+    val deltaDfInsert = addColumns(rawDf.join(baseDf, primaryKeys, "left_anti").select(rawDf("*")),dataDate,auditTimeStamps).sparkaid.reorderColumns(baseEmptyDf)
+    // Identify the records to be updated in the destination dataframe from the delta dataframe
+    val deltaDfUpdate = addColumns(rawDf.join(deltaDfInsert, primaryKeys, "left_anti").select(rawDf("*")),dataDate,auditTimeStamps).sparkaid.reorderColumns(baseEmptyDf)
+    //.withColumn("effective_ts",lit(currentTime)).withColumn("expiration_ts",lit(expirationTime)).withColumn("current_ind",lit(1)).withColumn("geo_region_cd", lit("US")).withColumn("tz_cd", lit("UTC")).withColumn("create_user", lit("svc-hr-etl")).withColumn("create_ts", lit(currentTime)).withColumn("upd_user", lit("svc-hr-etl")).withColumn("upd_ts", lit(currentTime))
+    // Combine the updated delta dataframe with the affected partition of the destination dataframe after dropping SCD type2 audit columns
+    val unionAllDf = affectedPartation.union(deltaDfUpdate)
+    // Create a new dataframe by de-duplicating unionUpdatedDf
+    // Use a checksum to compare current and previous rows (lag function)
+    // If the checksums for current and previous rows are different or if the previous row is null, mark it as 'Y' (indicating a unique record)
+    // Filter out the rows marked as 'N' (indicating duplicate records)
+    val dedupDf = unionAllDf.withColumn("colChkSum", concat_ws(",", scdType2Columns.map(k => col(k)): _*)).withColumn("colLagChkSum", lag(col("colChkSum"), 1, null).over(Window.partitionBy(primaryKeys.map(k => col(k)): _*).orderBy(col("effective_ts").cast("timestamp")))).withColumn("colDedupFlag", when(col("colChkSum") =!= col("colLagChkSum") || col("colLagChkSum").isNull, lit("Y")).otherwise(lit("N"))).filter(col("colDedupFlag") === lit("Y")).drop(col("colChkSum")).drop(col("colLagChkSum")).drop(col("colDedupFlag"))
+    val expDf = dedupDf.withColumn("effective_ts", col("effective_ts")).withColumn("expiration_ts", lead((col("effective_ts").cast("timestamp") - expr("INTERVAL 1 DAY")).cast("string"), 1, SC.expirationTime).over(Window.partitionBy(primaryKeys.map(k => col(k)): _*).orderBy(col("effective_ts").cast("timestamp")))).withColumn("current_ind", when(col("expiration_ts") === SC.expirationTime, lit("1")).otherwise(lit("0"))).withColumn("upd_ts", when(col("current_ind") === "0", lit(currentTime)).otherwise(col("upd_ts")))
+    val finalDf:DataFrame = expDf.union(nonAffectedPartation).union(deltaDfInsert)
+    finalDf
+  }
+
+  def scdType2History(rawDf: DataFrame, primaryKeys:List[String],scdType2Key: List[String], dataDate: String, auditTimeStamps: List[String], baseEmptyDf: DataFrame): DataFrame = {
+    val currentTime: String = time.LocalDateTime.now().toString
+    val expirationTime: String = SC.expirationTime
+    import com.walmart.reusable.sparkaid.DataFrameUtil._
+    val baseExcludeColumns = SC.scd_audit_columns ++ primaryKeys ++ auditTimeStamps
+    val rawExcludeColumns = primaryKeys ++ auditTimeStamps
+    val baseScdType2Columns = if (scdType2Key.head == SC.notFound) rawDf.columns.toList.filterNot(baseExcludeColumns.contains) else scdType2Key.toString.split(",").toList
+    val rawScdType2Columns = if (scdType2Key.head == SC.notFound) rawDf.columns.toList.filterNot(rawExcludeColumns.contains) else scdType2Key.toString.split(",").toList
+    val scdType2Columns = baseScdType2Columns ++ rawScdType2Columns
+    // Identify the new records to be inserted from the delta dataframe
+    val deltaDfInsert = addColumns(rawDf, dataDate, auditTimeStamps)
+    print("deltaDfInsert",deltaDfInsert.show(1))
+    // Create a new dataframe by de-duplicating deltaDfInsert
+    // Use a checksum to compare current and previous rows (lag function)
+    // If the checksums for current and previous rows are different or if the previous row is null, mark it as 'Y' (indicating a unique record)
+    // Filter out the rows marked as 'N' (indicating duplicate records)
+    val dedupDf = deltaDfInsert.withColumn("colChkSum", concat_ws(",", scdType2Columns.map(k => col(k)): _*)).withColumn("colLagChkSum", lag(col("colChkSum"), 1, null).over(Window.partitionBy(primaryKeys.map(k => col(k)): _*).orderBy(col("effective_ts").cast("timestamp")))).withColumn("colDedupFlag", when(col("colChkSum") =!= col("colLagChkSum") || col("colLagChkSum").isNull, lit("Y")).otherwise(lit("N"))).filter(col("colDedupFlag") === lit("Y")).drop(col("colChkSum")).drop(col("colLagChkSum")).drop(col("colDedupFlag"))
+    val finalDf: DataFrame = dedupDf.withColumn("effective_ts", col("effective_ts")).withColumn("expiration_ts", lead((col("effective_ts").cast("timestamp") - expr("INTERVAL 1 DAY")).cast("string"), 1, SC.expirationTime).over(Window.partitionBy(primaryKeys.map(k => col(k)): _*).orderBy(col("effective_ts").cast("timestamp")))).withColumn("current_ind", when(col("expiration_ts") === SC.expirationTime, lit("1")).otherwise(lit("0"))).withColumn("upd_ts", when(col("current_ind") === "0", lit(currentTime)).otherwise(col("upd_ts")))
+    finalDf
+  }
